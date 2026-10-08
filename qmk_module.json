@@ -1,0 +1,7 @@
+{
+    "module_name": "Adaptive backlight",
+    "maintainer": "eitanhol",
+    "features": {
+        "via": true
+    }
+}
