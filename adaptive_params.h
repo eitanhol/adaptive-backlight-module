@@ -103,6 +103,19 @@ enum adaptive_param_id {
                                     * shift down; the last one cannot be deleted */
 #define ADAPTIVE_VID_REVERT 0x96  /* set: reload the active preset, discarding
                                    * unsaved live changes                         */
+#define ADAPTIVE_VID_SOCD 0x9D    /* set: [armed 0/1] - persists in EEPROM
+                                   * get: [armed, 0, 1 (= chord support)]        */
+#define ADAPTIVE_VID_SOCD_CHORD 0x9E /* the key combination that toggles SOCD.
+                                   * set: [0 cancel recording | 1 start recording
+                                   *       | 2 clear the chord]
+                                   * get: [state 0 idle / 1 recording / 2 just
+                                   *       recorded, n, kc0 hi, lo, ... kc3]
+                                   * Recording: every key pressed is swallowed
+                                   * and added (max 4); it ends when the first
+                                   * pressed key is released. The chord is kept
+                                   * in slot 0's padding words of the EEPROM
+                                   * block, so nothing else moves.               */
+#define ADAPTIVE_SOCD_CHORD_MAX 4
 
 /* Board self-description, so the app needs no per-keyboard tables.
  * All three are get-only. value_data has 29 usable bytes. */

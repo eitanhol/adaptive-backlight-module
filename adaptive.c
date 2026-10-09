@@ -53,6 +53,120 @@ ASSERT_COMMUNITY_MODULES_MIN_API_VERSION(1, 0, 0);
 static bool socd_1_held = false, socd_1_suppressed = false;
 static bool socd_2_held = false, socd_2_suppressed = false;
 
+/* Armed/disarmed. The filter runs only while armed, so it never touches
+ * normal typing when off. The state is kept in bit0 of the EEPROM block's
+ * spare word, so saved presets are not moved. It is toggled by the app
+ * (value id 0x9D) or by a key chord recorded from the keyboard (0x9E). */
+static bool socd_armed = false;   /* persisted */
+static bool socd_on    = false;   /* the filter is active */
+
+static void socd_update(void) {
+    bool on = socd_armed;
+    if (!on && socd_on) {
+        /* going quiet mid-hold: give a suppressed key back to the host so
+         * nothing is left in a state QMK does not know about */
+        if (socd_1_held && socd_1_suppressed) register_code(SOCD_KEY_1);
+        if (socd_2_held && socd_2_suppressed) register_code(SOCD_KEY_2);
+        socd_1_suppressed = socd_2_suppressed = false;
+    }
+    socd_on = on;
+}
+
+static void adaptive_store(void); /* below: writes the EEPROM block */
+static void socd_set_armed(bool armed) {
+    socd_armed = armed;
+    socd_update();
+    adaptive_store();
+}
+
+/* ---- toggle chord: up to 4 keycodes that must all be down ----
+ * Recording (started by the app): every key pressed is swallowed and
+ * appended; the first key's release ends it and saves. Triggering: the
+ * press that completes the chord toggles SOCD and is swallowed (its
+ * release too), then nothing fires again until a chord key is released. */
+static uint16_t socd_chord[ADAPTIVE_SOCD_CHORD_MAX];   /* 0 = unused */
+static uint8_t  socd_chord_n = 0;
+static uint8_t  socd_rec_state = 0;                     /* 0 idle, 1 recording, 2 just recorded */
+static uint16_t socd_rec_first = 0;
+static uint16_t socd_rec_down[8];                       /* keys pressed during recording, so only their releases are swallowed */
+static uint8_t  socd_rec_down_n = 0;
+static uint16_t socd_down[8];                           /* keys currently down (for chord matching) */
+static uint8_t  socd_down_n = 0;
+static bool     socd_chord_fired = false;
+static uint16_t socd_swallow_release = 0;               /* the chord's completing key: eat its release */
+
+static void socd_chord_load(void);
+static void socd_chord_save(void);
+
+static bool socd_list_has(const uint16_t *l, uint8_t n, uint16_t kc) {
+    for (uint8_t i = 0; i < n; i++) if (l[i] == kc) return true;
+    return false;
+}
+static void socd_list_add(uint16_t *l, uint8_t *n, uint8_t max, uint16_t kc) {
+    if (*n < max && !socd_list_has(l, *n, kc)) l[(*n)++] = kc;
+}
+static void socd_list_del(uint16_t *l, uint8_t *n, uint16_t kc) {
+    for (uint8_t i = 0; i < *n; i++) if (l[i] == kc) { l[i] = l[--(*n)]; return; }
+}
+
+/* returns true when the event was consumed */
+static bool socd_chord_process(uint16_t keycode, keyrecord_t *record) {
+    if (socd_rec_state == 1) {
+        if (record->event.pressed) {
+            if (socd_rec_first == 0) socd_rec_first = keycode;
+            socd_list_add(socd_rec_down, &socd_rec_down_n, 8, keycode);
+            if (socd_chord_n < ADAPTIVE_SOCD_CHORD_MAX && !socd_list_has(socd_chord, socd_chord_n, keycode)) {
+                socd_chord[socd_chord_n++] = keycode;
+            }
+            return true;
+        }
+        if (socd_list_has(socd_rec_down, socd_rec_down_n, keycode)) {
+            socd_list_del(socd_rec_down, &socd_rec_down_n, keycode);
+            if (keycode == socd_rec_first) {       /* first key up: done */
+                socd_rec_state = 2;
+                socd_chord_save();
+            }
+            return true;
+        }
+        return false;                              /* was down before recording started */
+    }
+    if (socd_rec_state == 2 && socd_rec_down_n) {  /* remaining recorded keys still coming up */
+        if (!record->event.pressed && socd_list_has(socd_rec_down, socd_rec_down_n, keycode)) {
+            socd_list_del(socd_rec_down, &socd_rec_down_n, keycode);
+            return true;
+        }
+    }
+
+    if (record->event.pressed) {
+        socd_list_add(socd_down, &socd_down_n, 8, keycode);
+        if (socd_chord_n && !socd_chord_fired && socd_list_has(socd_chord, socd_chord_n, keycode)) {
+            bool all = true;
+            for (uint8_t i = 0; i < socd_chord_n; i++) if (!socd_list_has(socd_down, socd_down_n, socd_chord[i])) all = false;
+            if (all) {
+                socd_chord_fired      = true;
+                socd_swallow_release  = keycode;
+                socd_set_armed(!socd_armed);
+                return true;
+            }
+        }
+    } else {
+        socd_list_del(socd_down, &socd_down_n, keycode);
+        if (socd_list_has(socd_chord, socd_chord_n, keycode)) socd_chord_fired = false;
+        if (keycode == socd_swallow_release) { socd_swallow_release = 0; return true; }
+    }
+    return false;
+}
+
+static void socd_chord_begin(void) {
+    socd_rec_state = 1; socd_rec_first = 0; socd_rec_down_n = 0; socd_chord_n = 0;
+    memset(socd_chord, 0, sizeof(socd_chord));
+}
+static void socd_chord_clear(void) {
+    socd_rec_state = 0; socd_chord_n = 0;
+    memset(socd_chord, 0, sizeof(socd_chord));
+    socd_chord_save();
+}
+
 static void socd_filter(uint16_t keycode, keyrecord_t *record) {
     uint16_t other;
     bool    *self_held, *self_supp, *other_held, *other_supp;
@@ -187,6 +301,28 @@ _Static_assert(sizeof(adaptive_ee_t) == EECONFIG_USER_DATA_SIZE,
 /* RAM master copy of all slots; EEPROM is its backup. */
 static adaptive_ee_t adaptive_ee;
 
+#define ADAPTIVE_SPARE_SOCD_ARMED 0x0001 /* bit0 of adaptive_ee.spare */
+static void adaptive_store(void) {
+    adaptive_ee.spare = (adaptive_ee.spare & ~ADAPTIVE_SPARE_SOCD_ARMED) | (socd_armed ? ADAPTIVE_SPARE_SOCD_ARMED : 0);
+    eeconfig_update_user_datablock(&adaptive_ee);
+}
+/* the chord lives in the padding words of slot 0 (p[0][AP_COUNT..]):
+ * saves copy only AP_COUNT words into a slot, and slot deletes shift only
+ * AP_COUNT words, so these never move */
+_Static_assert(AP_COUNT + ADAPTIVE_SOCD_CHORD_MAX <= ADAPTIVE_SLOT_PAD, "no room for the chord in the slot padding");
+static void socd_chord_load(void) {
+    socd_chord_n = 0;
+    for (uint8_t i = 0; i < ADAPTIVE_SOCD_CHORD_MAX; i++) {
+        uint16_t kc = adaptive_ee.p[0][AP_COUNT + i];
+        if (kc == 0 || kc == 0xFFFF) break;
+        socd_chord[socd_chord_n++] = kc;
+    }
+}
+static void socd_chord_save(void) {
+    for (uint8_t i = 0; i < ADAPTIVE_SOCD_CHORD_MAX; i++) adaptive_ee.p[0][AP_COUNT + i] = (i < socd_chord_n) ? socd_chord[i] : 0;
+    eeconfig_update_user_datablock(&adaptive_ee);
+}
+
 /* Divisors are used as denominators in the effect - a zero would
  * fault the board and leave it needing a reflash to recover. */
 static uint16_t adaptive_clamp(uint8_t id, uint16_t v) {
@@ -266,6 +402,9 @@ static void adaptive_load(void) {
     if (adaptive_ee.count < 1 || adaptive_ee.count > ADAPTIVE_PRESETS) adaptive_ee.count = 1;
     if (adaptive_ee.active >= adaptive_ee.count) adaptive_ee.active = 0;
     adaptive_apply_slot((uint8_t)adaptive_ee.active);
+    socd_armed = (adaptive_ee.spare & ADAPTIVE_SPARE_SOCD_ARMED) != 0;
+    socd_update();
+    socd_chord_load();
 }
 
 /* Save = write the live values into the ACTIVE preset slot. */
@@ -303,7 +442,7 @@ static void adaptive_slot_del(uint8_t s) {
     if (adaptive_ee.count <= 1 || s >= adaptive_ee.count) return;
     bool reload = (adaptive_ee.active == s);
     for (uint8_t i = s; i + 1 < adaptive_ee.count; i++) {
-        memcpy(adaptive_ee.p[i], adaptive_ee.p[i + 1], sizeof(adaptive_ee.p[i]));
+        memcpy(adaptive_ee.p[i], adaptive_ee.p[i + 1], sizeof(adaptive_params)); /* params only; padding holds the chord */
     }
     adaptive_ee.count--;
     if (adaptive_ee.active > s) adaptive_ee.active--;
@@ -365,6 +504,12 @@ void via_custom_value_command_kb(uint8_t *data, uint8_t length) {
                 adaptive_slot_del(value_data[0]);
             } else if (*value_id == ADAPTIVE_VID_REVERT) {
                 adaptive_revert();
+            } else if (*value_id == ADAPTIVE_VID_SOCD) {
+                socd_set_armed(value_data[0] != 0);
+            } else if (*value_id == ADAPTIVE_VID_SOCD_CHORD) {
+                if (value_data[0] == 1) socd_chord_begin();
+                else if (value_data[0] == 2) socd_chord_clear();
+                else { if (socd_rec_state == 1) socd_chord_load(); socd_rec_state = 0; socd_rec_down_n = 0; } /* cancel: back to the saved chord */
             } else if (*value_id == ADAPTIVE_VID_REBOOT) {
                 /* jump straight to the DFU bootloader so the flasher can
                  * grab it with no keypress. Same call QK_BOOT makes. */
@@ -394,6 +539,19 @@ void via_custom_value_command_kb(uint8_t *data, uint8_t length) {
                 value_data[2] = adaptive_lt_level;
                 value_data[3] = (uint8_t)adaptive_ee.count;
                 value_data[4] = ADAPTIVE_PRESETS;
+                value_data[5] = socd_on ? 1 : 0; /* so the app mirrors key toggles */
+            } else if (*value_id == ADAPTIVE_VID_SOCD) {
+                value_data[0] = socd_armed ? 1 : 0;
+                value_data[1] = 0;
+                value_data[2] = 1; /* chord support */
+            } else if (*value_id == ADAPTIVE_VID_SOCD_CHORD) {
+                value_data[0] = socd_rec_state;
+                value_data[1] = socd_chord_n;
+                for (uint8_t i = 0; i < ADAPTIVE_SOCD_CHORD_MAX; i++) {
+                    value_data[2 + i * 2] = socd_chord[i] >> 8;
+                    value_data[3 + i * 2] = socd_chord[i] & 0xFF;
+                }
+                if (socd_rec_state == 2) socd_rec_state = 0; /* "just recorded" is reported once */
             } else if (*value_id == ADAPTIVE_VID_GEOM_INFO) {
                 /* board self-description: the app builds its LED table
                  * and key-to-LED map from these instead of shipping a
@@ -649,7 +807,8 @@ bool process_record_adaptive(uint16_t keycode, keyrecord_t *record) {
         return false;
     }
 
-    socd_filter(keycode, record);
+    if (socd_chord_process(keycode, record)) return false; /* recording, or the chord fired */
+    if (socd_on) socd_filter(keycode, record);
 
     if (record->event.pressed) {
         last_input_time = timer_read32();
